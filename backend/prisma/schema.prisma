@@ -10,11 +10,12 @@ generator client {
 
 datasource db {
   provider = "mongodb"
-  url      = env("mongodb+srv://Naveen:2130@help-bot.1uv3j.mongodb.net/webScraper?retryWrites=true&w=majority")
+  url      = env("DATABASE_URL")
 }
 
 model ScrapedData {
   id      String @id @default(auto()) @map("_id") @db.ObjectId
-  url     String
+  title   String
   content String
+  url     String? 
 }
