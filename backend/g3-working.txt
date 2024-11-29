@@ -1,0 +1,335 @@
+const express = require('express');
+const playwright = require('playwright');
+const url = require('url');
+const cors = require('cors');
+const cheerio = require('cheerio'); // For parsing HTML and extracting links
+require('dotenv').config();
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+const { GoogleGenerativeAI } = require('@google/generative-ai'); // Import the GoogleGenerativeAI client
+
+const app = express();
+const port = 5000;
+
+// Middleware to handle CORS and JSON parsing
+app.use(cors());
+app.use(express.json());
+
+// Initialize the Google Generative AI client
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY); // Use your GEMINI API key from .env
+const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+// Function to extract internal links from a page
+const extractInternalLinks = (baseUrl, pageContent, visited) => {
+  const $ = cheerio.load(pageContent);
+  const links = [];
+
+  // Find all anchor tags with href attributes
+  $('a').each((_, element) => {
+    let href = $(element).attr('href');
+    if (href) {
+      // Resolve relative links to absolute ones
+      const absoluteUrl = url.resolve(baseUrl, href);
+
+      // Ensure it's part of the same domain and not external, also check if it's already visited
+      if (absoluteUrl.startsWith(baseUrl) && !visited.has(absoluteUrl)) {
+        links.push(absoluteUrl); // Only keep links from the same domain
+      }
+    }
+  });
+
+  return links;
+};
+
+// Function to scrape content from a single page
+const scrapePage = async (pageUrl, browser) => {
+  const page = await browser.newPage();
+  await page.goto(pageUrl, { waitUntil: 'domcontentloaded' });
+
+  // Get the full HTML content of the page
+  const pageContent = await page.content(); // Playwright fetches the full HTML
+  const title = await page.title();
+  const textContent = await page.evaluate(() => document.body.innerText);
+
+  await page.close();
+
+  return {
+    url: pageUrl,
+    title,
+    content: textContent,
+    html: pageContent,
+  };
+};
+
+// Function to crawl the given URL and scrape all internal pages
+const crawlAndScrape = async (startUrl, browser) => {
+  const visited = new Set(); // To avoid revisiting the same page
+  const toVisit = [startUrl]; // Pages to visit
+  let scrapedContent = [];
+
+  while (toVisit.length > 0) {
+    const currentUrl = toVisit.pop();
+    if (visited.has(currentUrl)) continue; // Skip already visited pages
+    visited.add(currentUrl);
+
+    try {
+      console.log('Visiting:', currentUrl); // Log the URL being visited
+      // Scrape the current page
+      const pageData = await scrapePage(currentUrl, browser);
+      scrapedContent.push(pageData);
+
+      // Get the internal links on this page
+      const links = extractInternalLinks(currentUrl, pageData.html, visited);
+      console.log('Found links:', links); // Log the links found on the page
+
+      // Add new links to the queue
+      links.forEach(link => {
+        if (!visited.has(link)) {
+          toVisit.push(link);
+        }
+      });
+    } catch (err) {
+      console.error(`Error scraping page ${currentUrl}:`, err);
+    }
+  }
+
+  return scrapedContent;
+};
+
+// Route to scrape content from the provided URL
+app.post('/scrape', async (req, res) => {
+  const { url: startUrl } = req.body;
+
+  if (!startUrl) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
+
+  try {
+    const browser = await playwright.chromium.launch({ headless: true });
+    const scrapedContent = await crawlAndScrape(startUrl, browser);
+    await browser.close();
+
+    // Save scraped data to the database
+    for (const page of scrapedContent) {
+      await prisma.scrapedData.create({
+        data: {
+          title: page.title,
+          content: page.content,
+          url: page.url,
+        },
+      });
+    }
+
+    res.json({ scrapedContent });
+  } catch (error) {
+    console.error('Error during scraping:', error);
+    res.status(500).json({ error: 'Failed to scrape the URL. Please try again later.' });
+  } finally {
+    await prisma.$disconnect();
+  }
+});
+
+// Route to query scraped data and enhance response with AI (Google Vertex AI / Gemini)
+// Route to query scraped data and enhance response with AI (Google Vertex AI / Gemini)
+app.post('/query', async (req, res) => {
+  const { query } = req.body;
+
+  if (!query) {
+    return res.status(400).json({ error: 'Query is required' });
+  }
+
+  try {
+    const normalizedQuery = query.toLowerCase();
+    console.log('Normalized query:', normalizedQuery);  // Log the normalized query
+
+    // Get scraped data that might be useful for the AI model
+    const scrapedData = await prisma.scrapedData.findFirst(); // Get the first piece of content
+
+    // If no scraped data, return a generic response
+    if (!scrapedData) {
+      return res.json({ response: 'Sorry, I do not have enough information about this site yet.' });
+    }
+
+    // Construct the prompt for AI model
+    const prompt = `
+  The user has asked: "${query}". 
+  We have the following content about this site:
+  "${scrapedData.content}"
+
+  Please analyze the query and provide a helpful and accurate response based on the content of the website.
+  If the query is a greeting, respond with an appropriate friendly greeting that invites the user to ask more specific questions or explore the website. 
+  If the query doesn't relate to the content, encourage them to ask a more specific question or provide more context.
+  If the query is related to the content of the site, provide an answer based on the site's information.
+`;
+
+
+    // Send the prompt to the AI model for analysis and response
+    const aiResult = await model.generateContent(prompt);
+
+    // Return the AI-generated response
+    res.json({
+      response: aiResult.response.text() || 'I couldn\'t generate a response.',
+      content: scrapedData.content,
+    });
+  } catch (error) {
+    console.error('Error during query processing:', error.message);
+    res.status(500).json({
+      error: 'Query failed',
+      details: error.message,
+    });
+  }
+});
+
+
+// Start the server
+app.listen(port, () => console.log(`Server running on port ${port}`));
+
+
+front end------------------------------------------------------------------------------------------------
+
+import { useState } from 'react';
+import axios from 'axios';
+import { marked } from 'marked';  // Import marked library for Markdown conversion
+
+const WebScrapper = () => {
+  const [message, setMessage] = useState(''); // URL to scrape
+  const [query, setQuery] = useState(''); // User's query
+  const [response, setResponse] = useState(''); // Response to display from server
+  const [loading, setLoading] = useState(false); // Show loading state
+  const [error, setError] = useState(''); // For handling errors
+  const [selectedQuestion, setSelectedQuestion] = useState(''); // Track selected predefined question
+
+  // Predefined questions for the user to select
+  const predefinedQuestions = [
+    'What is the purpose of this website?',
+    'Can you summarize the main content?',
+    'What are the key features of the site?',
+  ];
+
+  // Function to check if the query is a greeting
+  const isGreeting = (query) => {
+    const greetings = ['hi', 'hello', 'hey', 'hii', 'howdy'];
+    return greetings.some(greeting => query.toLowerCase().includes(greeting));
+  };
+
+  // Send the URL to the backend server for scraping
+// Send the URL to the backend server for scraping
+const handleSendMessage = async () => {
+  if (!message) {
+    setError('Please enter a valid URL');
+    return; // Prevent request if the URL is empty
+  }
+
+  setError(''); // Clear any previous errors
+  setLoading(true); // Show loading indicator
+  console.log('Sending request with URL:', message); // Log the URL being sent
+
+  try {
+    // Send URL to backend for scraping
+    const res = await axios.post('http://localhost:5000/scrape', {
+      url: message,
+    });
+
+    console.log('Received response:', res.data); // Log the response from the server
+
+    // Check if the response contains valid content
+    if (Array.isArray(res.data.scrapedContent)) {
+      const formattedResponse = res.data.scrapedContent.map((item, index) => (
+        `<strong>Page ${index + 1}: <a href="${item.url}" target="_blank">${item.url}</a></strong><br /><br />${item.content}<br /><br />`
+      )).join(''); 
+
+      setResponse(formattedResponse);
+    } else {
+      setResponse('No valid content found.');
+    }
+
+  } catch (error) {
+    console.error('Error during API call:', error); // Log any errors
+    setError('Error while scraping. Please try again later.');
+    setResponse(''); // Clear the previous response if there's an error
+  } finally {
+    setLoading(false); // Hide loading indicator
+  }
+};
+
+
+  // Send the query (or selected question) to the backend for processing
+  const handleQuery = async () => {
+    const queryToSend = selectedQuestion || query;
+  
+    if (!queryToSend) {
+      setError('Please enter or select a valid query');
+      return;
+    }
+  
+    setError('');
+    setLoading(true);
+    console.log('Sending query:', queryToSend);
+  
+    try {
+      // Remove the greeting check and directly send the query
+      const res = await axios.post('http://localhost:5000/query', {
+        query: queryToSend,
+      });
+  
+      console.log('Received AI response:', res.data);
+  
+      // Convert the AI response from Markdown to HTML
+      const htmlResponse = marked(res.data.response);  // Convert Markdown to HTML
+  
+      setResponse(`<strong>AI Analysis:</strong><br />${htmlResponse}<br /><br /><strong>Original Content:</strong><br />${res.data.content}`);
+  
+    } catch (error) {
+      console.error('Error during query API call:', error);
+      setError('Error while querying. Please try again later.');
+      setResponse('');
+    } finally {
+      setLoading(false);
+    }
+  };
+  
+
+  return (
+    <div>
+      <h1>AI-Enhanced Web Scraping</h1>
+
+      <div>
+        <textarea
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          placeholder="Enter URL to scrape"
+        ></textarea>
+        <button onClick={handleSendMessage} disabled={loading}>Start Scraping</button>
+      </div>
+
+      <div>
+        {/* Predefined Questions Dropdown */}
+        <select 
+          value={selectedQuestion} 
+          onChange={(e) => setSelectedQuestion(e.target.value)} 
+          disabled={loading}>
+          <option value="">Select a predefined question</option>
+          {predefinedQuestions.map((question, index) => (
+            <option key={index} value={question}>{question}</option>
+          ))}
+        </select>
+
+        {/* User Custom Query Input */}
+        <textarea
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Enter your query"
+          disabled={selectedQuestion !== ''}
+        ></textarea>
+
+        <button onClick={handleQuery} disabled={loading}>Submit Query</button>
+      </div>
+
+      {loading && <p>Loading...</p>}
+      {error && <p style={{ color: 'red' }}>{error}</p>}
+      {response && <div dangerouslySetInnerHTML={{ __html: response }} />}
+    </div>
+  );
+};
+
+export default WebScrapper;

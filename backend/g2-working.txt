@@ -1,0 +1,213 @@
+const express = require('express');
+const playwright = require('playwright');
+const url = require('url');
+const cors = require('cors');
+const cheerio = require('cheerio'); // For parsing HTML and extracting links
+require('dotenv').config();
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+const { GoogleGenerativeAI } = require('@google/generative-ai'); // Import the GoogleGenerativeAI client
+
+const app = express();
+const port = 5000;
+
+// Middleware to handle CORS and JSON parsing
+app.use(cors());
+app.use(express.json());
+
+// Initialize the Google Generative AI client
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY); // Use your GEMINI API key from .env
+const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+// Function to extract internal links from a page
+const extractInternalLinks = (baseUrl, pageContent, visited) => {
+  const $ = cheerio.load(pageContent);
+  const links = [];
+
+  // Find all anchor tags with href attributes
+  $('a').each((_, element) => {
+    let href = $(element).attr('href');
+    if (href) {
+      // Resolve relative links to absolute ones
+      const absoluteUrl = url.resolve(baseUrl, href);
+
+      // Ensure it's part of the same domain and not external, also check if it's already visited
+      if (absoluteUrl.startsWith(baseUrl) && !visited.has(absoluteUrl)) {
+        links.push(absoluteUrl); // Only keep links from the same domain
+      }
+    }
+  });
+
+  return links;
+};
+
+// Function to scrape content from a single page
+const scrapePage = async (pageUrl, browser) => {
+  const page = await browser.newPage();
+  await page.goto(pageUrl, { waitUntil: 'domcontentloaded' });
+
+  // Get the full HTML content of the page
+  const pageContent = await page.content(); // Playwright fetches the full HTML
+  const title = await page.title();
+  const textContent = await page.evaluate(() => document.body.innerText);
+
+  await page.close();
+
+  return {
+    url: pageUrl,
+    title,
+    content: textContent,
+    html: pageContent,
+  };
+};
+
+// Function to crawl the given URL and scrape all internal pages
+const crawlAndScrape = async (startUrl, browser) => {
+  const visited = new Set(); // To avoid revisiting the same page
+  const toVisit = [startUrl]; // Pages to visit
+  let scrapedContent = [];
+
+  while (toVisit.length > 0) {
+    const currentUrl = toVisit.pop();
+    if (visited.has(currentUrl)) continue; // Skip already visited pages
+    visited.add(currentUrl);
+
+    try {
+      console.log('Visiting:', currentUrl); // Log the URL being visited
+      // Scrape the current page
+      const pageData = await scrapePage(currentUrl, browser);
+      scrapedContent.push(pageData);
+
+      // Get the internal links on this page
+      const links = extractInternalLinks(currentUrl, pageData.html, visited);
+      console.log('Found links:', links); // Log the links found on the page
+
+      // Add new links to the queue
+      links.forEach(link => {
+        if (!visited.has(link)) {
+          toVisit.push(link);
+        }
+      });
+    } catch (err) {
+      console.error(`Error scraping page ${currentUrl}:`, err);
+    }
+  }
+
+  return scrapedContent;
+};
+
+// Route to scrape content from the provided URL
+app.post('/scrape', async (req, res) => {
+  const { url: startUrl } = req.body;
+
+  if (!startUrl) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
+
+  try {
+    const browser = await playwright.chromium.launch({ headless: true });
+    const scrapedContent = await crawlAndScrape(startUrl, browser);
+    await browser.close();
+
+    // Save scraped data to the database
+    for (const page of scrapedContent) {
+      await prisma.scrapedData.create({
+        data: {
+          title: page.title,
+          content: page.content,
+          url: page.url,
+        },
+      });
+    }
+
+    res.json({ scrapedContent });
+  } catch (error) {
+    console.error('Error during scraping:', error);
+    res.status(500).json({ error: 'Failed to scrape the URL. Please try again later.' });
+  } finally {
+    await prisma.$disconnect();
+  }
+});
+
+// Route to query scraped data and enhance response with AI (Google Vertex AI / Gemini)
+app.post('/query', async (req, res) => {
+  const { query } = req.body;
+
+  if (!query) {
+    return res.status(400).json({ error: 'Query is required' });
+  }
+
+  try {
+    // Normalize the query by converting to lowercase
+    const normalizedQuery = query.toLowerCase();
+
+    // Handling greetings
+    const greetings = ['hi', 'hello', 'hey', 'howdy'];
+    if (greetings.some(greeting => normalizedQuery.includes(greeting))) {
+      return res.json({ response: 'Hello! How can I assist you today?' });
+    }
+
+    // Handling help-related queries
+    if (normalizedQuery.includes('help')) {
+      return res.json({ response: 'How can I help you? Please ask your query.' });
+    }
+
+    // Handling site-related queries
+    if (
+      normalizedQuery.includes('what is this site about') ||
+      normalizedQuery.includes('tell me about this site') ||
+      normalizedQuery.includes('i need to get to know about this site')
+    ) {
+      // Fetch scraped data from the database to use as context
+      const scrapedData = await prisma.scrapedData.findFirst(); // Get the first content (or query more if needed)
+      if (scrapedData) {
+        // Generate a response using Google Gemini or Vertex AI model
+        const prompt = `The user asked: "${query}". Here's some content from the site: "${scrapedData.content}". Can you explain what this site is about based on this?`;
+
+        const aiResult = await model.generateContent(prompt);
+
+        // Return the AI-generated response
+        return res.json({
+          response: aiResult.response.text() || 'I couldn\'t find a clear explanation of this site.',
+        });
+      } else {
+        return res.json({ response: 'Sorry, I do not have enough information about this site yet.' });
+      }
+    }
+
+    // For other queries, search in the scraped data
+    const data = await prisma.scrapedData.findFirst({
+      where: {
+        content: {
+          contains: query,
+          mode: 'insensitive', // Case-insensitive search
+        },
+      },
+    });
+
+    if (!data) {
+      return res.status(404).json({ response: 'No relevant data found.' });
+    }
+
+    // Structuring the prompt for AI model
+    const prompt = `${query}\n\nHere's some relevant content from the site:\n${data.content}. Please generate a response based on this context.`;
+
+    // Call the NLP model to generate a response
+    const aiResult = await model.generateContent(prompt);
+
+    res.json({
+      response: aiResult.response.text() || 'No AI response found.',
+      content: data.content,
+    });
+  } catch (error) {
+    console.error('Error during query processing:', error.message);
+    res.status(500).json({
+      error: 'Query failed',
+      details: error.message,
+    });
+  }
+});
+
+
+// Start the server
+app.listen(port, () => console.log(`Server running on port ${port}`));
